@@ -1,5 +1,6 @@
 """Core layers: Expert FFN, Router, MoE, Multi-Head Attention, Transformer Block."""
 
+import math
 from typing import Tuple
 
 import jax
@@ -37,28 +38,53 @@ class ExpertFFN(nn.Module):
 class Router(nn.Module):
     """Top-k gating network that routes tokens to experts.
 
-    Produces per-token expert weights and computes an auxiliary
-    load-balancing loss to encourage uniform expert utilisation.
+    Improvements over vanilla top-k routing:
+
+    * **Jitter noise** — small uniform noise added to logits during training
+      encourages exploration and reduces expert collapse.
+    * **Z-loss** — penalises large logit magnitudes (per ST-MoE) to keep
+      routing distributions numerically stable.
+    * **Aux load-balancing loss** — Switch Transformer-style loss that pushes
+      the router towards uniform expert utilisation.
     """
 
     n_experts: int
     top_k: int
+    jitter_noise: float = 0.0
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def __call__(
+        self, x: jnp.ndarray, deterministic: bool = True
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Route tokens to experts.
 
         Args:
             x: Input tensor of shape (batch, seq_len, d_model).
+            deterministic: If False, apply jitter noise to logits.
 
         Returns:
             gates:     (batch, seq_len, top_k) — softmax weights for selected experts.
             indices:   (batch, seq_len, top_k) — indices of selected experts.
             aux_loss:  Scalar load-balancing loss.
+            z_loss:    Scalar z-loss for routing logit stability.
         """
         # Compute raw logits → (batch, seq_len, n_experts)
         logits = nn.Dense(self.n_experts, use_bias=False,
                           kernel_init=nn.initializers.xavier_uniform())(x)
+
+        # Optional jitter noise during training (improves expert exploration)
+        if not deterministic and self.jitter_noise > 0.0:
+            noise = jax.random.uniform(
+                self.make_rng('dropout'),
+                logits.shape,
+                minval=-self.jitter_noise,
+                maxval=self.jitter_noise,
+            )
+            logits = logits + noise
+
+        # ---- Z-loss: E[log(sum(exp(logits)))^2] (ST-MoE, Zoph et al. 2022) ----
+        # Penalises large logit magnitudes; keeps routing probabilities well-scaled.
+        z_loss = jnp.mean(jax.nn.logsumexp(logits, axis=-1) ** 2)
 
         # Full softmax over experts for load-balance computation
         probs = jax.nn.softmax(logits, axis=-1)  # (B, T, E)
@@ -70,17 +96,17 @@ class Router(nn.Module):
         gates = jax.nn.softmax(top_k_values, axis=-1)  # (B, T, K)
 
         # ---- Auxiliary load-balancing loss (Switch Transformer style) ----
-        # f_i = fraction of tokens routed to expert i
+        # f_i = fraction of tokens routed to expert i  (top-1 dispatch fraction)
         # P_i = mean routing probability for expert i
         # aux_loss = n_experts * sum_i(f_i * P_i)
-        # One-hot of top-1 choice → (B, T, E)
-        top1_idx = top_k_indices[..., 0]
-        dispatch_mask = jax.nn.one_hot(top1_idx, self.n_experts)  # (B, T, E)
-        f = jnp.mean(dispatch_mask, axis=(0, 1))  # (E,)
-        P = jnp.mean(probs, axis=(0, 1))           # (E,)
+        flat_top1 = top_k_indices.reshape(-1, self.top_k)[:, 0]     # (N,)
+        flat_probs = probs.reshape(-1, self.n_experts)                # (N, E)
+        dispatch_mask = jax.nn.one_hot(flat_top1, self.n_experts)    # (N, E)
+        f = jnp.mean(dispatch_mask, axis=0)                          # (E,)
+        P = jnp.mean(flat_probs, axis=0)                             # (E,)
         aux_loss = self.n_experts * jnp.sum(f * P)
 
-        return gates, top_k_indices, aux_loss
+        return gates, top_k_indices, aux_loss, z_loss
 
 
 # ---------------------------------------------------------------------------
@@ -88,62 +114,119 @@ class Router(nn.Module):
 # ---------------------------------------------------------------------------
 
 class MoELayer(nn.Module):
-    """Mixture-of-Experts layer: router + N expert FFNs.
+    """Capacity-aware Mixture-of-Experts layer using token dispatch/collect.
 
-    Each token is routed to top_k experts; their outputs are
-    combined via the gating weights.
+    Key improvements over the vanilla MoE layer:
+
+    * **Capacity-limited routing** — each expert processes at most
+      ``ceil(capacity_factor * N / n_experts)`` tokens per forward pass,
+      preventing any single expert from being overloaded.
+    * **Token dispatch / collect** — tokens are gathered into per-expert
+      batches of fixed size ``C`` (capacity), run through each expert
+      independently, then scattered back; JIT-friendly with static shapes.
+    * **Combined auxiliary losses** — aux load-balancing loss plus z-loss
+      (weighted by ``z_loss_coeff``) are returned as a single scalar so the
+      calling code needs no changes.
     """
 
     config: NanoMoEConfig
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(
+        self, x: jnp.ndarray, deterministic: bool = True
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """Forward pass.
 
         Args:
             x: (batch, seq_len, d_model)
-            deterministic: If True, disable dropout.
+            deterministic: If True, disable dropout and jitter noise.
 
         Returns:
-            output:   (batch, seq_len, d_model) — weighted expert outputs.
-            aux_loss: Scalar load-balancing loss.
+            output:       (batch, seq_len, d_model) — weighted expert outputs.
+            combined_aux: Scalar — aux load-balancing loss + z_loss_coeff * z_loss.
         """
         cfg = self.config
         B, T, D = x.shape
+        N = B * T
+        E, K = cfg.n_experts, cfg.top_k
 
-        # Route tokens → gates (B,T,K), indices (B,T,K), aux_loss scalar
-        gates, indices, aux_loss = Router(
-            n_experts=cfg.n_experts, top_k=cfg.top_k
-        )(x)
+        # ---- Router ----
+        gates, indices, aux_loss, z_loss = Router(
+            n_experts=E, top_k=K, jitter_noise=cfg.router_jitter_noise,
+        )(x, deterministic=deterministic)
+        # gates: (B, T, K), indices: (B, T, K) → flatten to (N, K)
+        gates_flat = gates.reshape(N, K)
+        indices_flat = indices.reshape(N, K)
 
-        # Initialise all experts as a list of modules
+        # ---- Capacity per expert ----
+        # capacity = ceil(capacity_factor * N / n_experts).
+        # Assignments beyond this limit are zero-gated (tokens are dropped).
+        capacity = max(1, math.ceil(cfg.capacity_factor * N / E))
+
+        # ---- Build dispatch tensor (static shapes, JIT-friendly) ----
+        # expert_mask[n, k, e] = 1  iff token n's k-th selection is expert e
+        expert_mask = jax.nn.one_hot(indices_flat, E)  # (N, K, E)
+
+        # Cumulative slot counter per expert — determines which slot each
+        # (token, k) assignment occupies inside its expert's capacity buffer.
+        flat_mask = expert_mask.reshape(N * K, E)            # (N*K, E)
+        cumcounts = jnp.cumsum(flat_mask, axis=0)            # (N*K, E)
+        # slot_indices[n, k] = 0-based slot index for assignment (n, k)
+        slot_indices = jnp.sum(
+            (cumcounts.reshape(N, K, E) - 1) * expert_mask, axis=-1
+        ).astype(jnp.int32)  # (N, K)
+
+        # Mask out assignments that exceed expert capacity
+        capacity_mask = slot_indices < capacity              # (N, K)
+        effective_gates = jnp.where(capacity_mask, gates_flat, 0.0)
+
+        # Clamp slot indices so one_hot below never goes out of range
+        safe_slots = jnp.clip(slot_indices, 0, capacity - 1)  # (N, K)
+
+        # dispatch[e, c, n] = 1  iff token n fills capacity slot c of expert e
+        slot_oh = jax.nn.one_hot(safe_slots, capacity)          # (N, K, C)
+        dispatch = jnp.einsum(
+            'nke,nkc->ecn',
+            expert_mask * capacity_mask[..., None],
+            slot_oh,
+        )  # (E, C, N)
+
+        # ---- Gather tokens into per-expert batches ----
+        tokens = x.reshape(N, D)                              # (N, D)
+        expert_input = jnp.einsum('ecn,nd->ecd', dispatch, tokens)  # (E, C, D)
+
+        # ---- Run each expert on its (capacity-sized) token batch ----
         experts = [
-            ExpertFFN(d_ff=cfg.d_ff, d_model=cfg.d_model, name=f"expert_{i}")
-            for i in range(cfg.n_experts)
+            ExpertFFN(d_ff=cfg.d_ff, d_model=D, name=f"expert_{i}")
+            for i in range(E)
         ]
-
-        # Compute ALL expert outputs → stack to (n_experts, B, T, D)
-        # Using a simple loop — for nano-scale this is efficient and
-        # avoids the dynamic-shape issues of scatter/gather in JAX.
         expert_outputs = jnp.stack(
-            [expert(x) for expert in experts], axis=0
-        )  # (E, B, T, D)
+            [experts[i](expert_input[i]) for i in range(E)], axis=0
+        )  # (E, C, D)
 
-        # Gather the top-k expert outputs for each token
-        # indices shape: (B, T, K)
-        # We need to pick from expert_outputs along axis 0
-        # expert_outputs[indices[b, t, k], b, t, :] for all b, t, k
-        batch_idx = jnp.arange(B)[:, None, None]   # (B, 1, 1)
-        seq_idx = jnp.arange(T)[None, :, None]     # (1, T, 1)
-        selected = expert_outputs[indices, batch_idx, seq_idx, :]  # (B, T, K, D)
+        # ---- Collect expert outputs back to token positions ----
+        # per_expert_output[e, n, :] = expert e's output for token n
+        per_expert_output = jnp.einsum(
+            'ecn,ecd->end', dispatch, expert_outputs
+        )  # (E, N, D)
 
-        # Weighted combination: gates (B, T, K, 1) * selected (B, T, K, D)
-        output = jnp.sum(gates[..., None] * selected, axis=2)  # (B, T, D)
+        # Weight by effective gates and sum across experts
+        per_expert_gate = jnp.einsum(
+            'nk,nke->ne', effective_gates, expert_mask
+        )  # (N, E)
+        output_flat = jnp.einsum(
+            'ne,end->nd', per_expert_gate, per_expert_output
+        )  # (N, D)
+
+        output = output_flat.reshape(B, T, D)
 
         # Optional dropout on the combined output
         output = nn.Dropout(rate=cfg.dropout_rate)(output, deterministic=deterministic)
 
-        return output, aux_loss
+        # Combined auxiliary loss
+        combined_aux = aux_loss + cfg.z_loss_coeff * z_loss
+
+        return output, combined_aux
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +289,7 @@ class TransformerBlock(nn.Module):
 
         Returns:
             output:   (B, T, D) — block output.
-            aux_loss: Scalar MoE load-balancing loss from this block.
+            aux_loss: Scalar MoE combined auxiliary loss (load-balance + z-loss).
         """
         # Self-attention sub-layer
         residual = x

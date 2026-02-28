@@ -21,6 +21,9 @@ def config():
         top_k=2,
         block_size=16,
         dropout_rate=0.0,
+        capacity_factor=1.25,
+        router_jitter_noise=0.0,
+        z_loss_coeff=1e-3,
     )
 
 
