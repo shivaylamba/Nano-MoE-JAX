@@ -16,8 +16,24 @@ class NanoMoEConfig:
         n_experts: Total number of expert FFNs in each MoE layer.
         top_k: Number of experts activated per token.
         block_size: Maximum sequence length (context window).
+        capacity_factor: Expert capacity multiplier. Each expert holds at most
+            ``ceil(capacity_factor * tokens / n_experts)`` tokens per forward
+            pass; assignments beyond this limit are dropped (zero-gated).
+            Under perfectly uniform routing, each expert receives
+            ``tokens * top_k / n_experts`` assignments, so
+            ``capacity_factor >= top_k`` guarantees no dropping.
+        router_jitter_noise: Half-width of uniform additive noise applied to
+            router logits during training (0 = disabled).  Improves exploration
+            and reduces expert collapse.
+        n_expert_groups: Number of expert groups for HierMoE two-stage routing.
+            Must evenly divide ``n_experts``.  Set to 1 (default) to use flat
+            routing (``HierMoELayer`` degenerates to standard top-k MoE).
+            Values > 1 enable the coarse group router followed by the fine
+            within-group router.
         dropout_rate: Dropout probability (used during training).
         aux_loss_coeff: Weight of the load-balancing auxiliary loss.
+        z_loss_coeff: Weight of the z-loss that penalises large router logit
+            magnitudes and keeps routing distributions stable.
         learning_rate: Peak learning rate for AdamW.
         weight_decay: AdamW weight decay coefficient.
         batch_size: Training batch size.
@@ -36,9 +52,17 @@ class NanoMoEConfig:
     top_k: int = 2
     block_size: int = 128
 
+    # --- MoE routing ---
+    capacity_factor: float = 1.25
+    router_jitter_noise: float = 0.0
+    # HierMoE: number of expert groups for two-stage routing.
+    # Must evenly divide n_experts.  Set to 1 (default) for flat routing.
+    n_expert_groups: int = 1
+
     # --- Regularization ---
     dropout_rate: float = 0.1
     aux_loss_coeff: float = 0.01
+    z_loss_coeff: float = 1e-3
 
     # --- Optimiser ---
     learning_rate: float = 3e-4

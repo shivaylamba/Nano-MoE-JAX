@@ -25,6 +25,10 @@ def main():
         n_experts=4,
         top_k=2,
         block_size=128,
+        # NanoMoE++ routing settings
+        capacity_factor=1.25,
+        router_jitter_noise=0.1,
+        z_loss_coeff=1e-3,
         dropout_rate=0.1,
         aux_loss_coeff=0.01,
         learning_rate=3e-4,
@@ -48,6 +52,9 @@ def main():
         n_experts=config.n_experts,
         top_k=config.top_k,
         block_size=config.block_size,
+        capacity_factor=config.capacity_factor,
+        router_jitter_noise=config.router_jitter_noise,
+        z_loss_coeff=config.z_loss_coeff,
         dropout_rate=config.dropout_rate,
         aux_loss_coeff=config.aux_loss_coeff,
         learning_rate=config.learning_rate,
@@ -59,12 +66,14 @@ def main():
     )
 
     print("\n" + "=" * 60)
-    print("  NanoMoE — Mixture-of-Experts Language Model (JAX)")
+    print("  NanoMoE++ — Mixture-of-Experts Language Model (JAX)")
     print("=" * 60)
     print(f"  Layers: {config.n_layers}  |  Heads: {config.n_heads}  |  "
           f"d_model: {config.d_model}")
     print(f"  Experts: {config.n_experts}  |  Top-K: {config.top_k}  |  "
           f"d_ff: {config.d_ff}")
+    print(f"  Capacity factor: {config.capacity_factor}  |  "
+          f"Jitter: {config.router_jitter_noise}  |  Z-loss coeff: {config.z_loss_coeff}")
     print(f"  Block size: {config.block_size}  |  Vocab: {config.vocab_size}")
 
     # ---- Init ----
