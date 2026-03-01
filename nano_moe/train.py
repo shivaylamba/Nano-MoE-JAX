@@ -1,6 +1,6 @@
 """Training utilities: train state, JIT-compiled steps, and training loop."""
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Type
 from functools import partial
 
 import jax
@@ -18,17 +18,23 @@ class TrainState(train_state.TrainState):
     dropout_rng: jax.Array
 
 
-def create_train_state(rng: jax.Array, config: NanoMoEConfig) -> TrainState:
+def create_train_state(
+    rng: jax.Array,
+    config: NanoMoEConfig,
+    model_cls: Type = NanoMoE,
+) -> TrainState:
     """Initialise model and optimiser.
 
     Args:
         rng: PRNG key.
         config: Model/training hyperparameters.
+        model_cls: Model class to instantiate (default :class:`~nano_moe.model.NanoMoE`).
+            Pass :class:`~nano_moe.model.HierNanoMoE` to train the hierarchical model.
 
     Returns:
         A TrainState with initialised parameters and AdamW optimiser.
     """
-    model = NanoMoE(config=config)
+    model = model_cls(config=config)
 
     rng, init_rng, dropout_rng = jax.random.split(rng, 3)
 

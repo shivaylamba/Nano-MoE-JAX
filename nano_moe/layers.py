@@ -304,3 +304,262 @@ class TransformerBlock(nn.Module):
         x = moe_out + residual
 
         return x, aux_loss
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical Router (HierMoE)
+# ---------------------------------------------------------------------------
+
+class HierRouter(nn.Module):
+    """Two-stage hierarchical routing network.
+
+    Stage 1 — *coarse*: projects each token to ``n_expert_groups`` logits and
+    selects the **top-1 group** via a group-level router.
+
+    Stage 2 — *fine*: projects each token to ``n_experts`` logits, masks to
+    the selected group, and picks the **top-k experts** within that group.
+
+    This reduces routing chaos for large expert counts, encourages coarse
+    topic-level specialisation at the group level, and fine-grained skill
+    specialisation at the expert level.
+
+    Args:
+        n_expert_groups: Number of expert groups (G).  Must evenly divide
+            ``n_experts``.
+        n_experts: Total expert count (E).
+        top_k: Experts activated per token from the selected group (K).
+        jitter_noise: Logit jitter half-width (0 = disabled).
+    """
+
+    n_expert_groups: int
+    n_experts: int
+    top_k: int
+    jitter_noise: float = 0.0
+
+    @nn.compact
+    def __call__(
+        self, x: jnp.ndarray, deterministic: bool = True
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Route tokens via two-stage hierarchy.
+
+        Args:
+            x: (batch, seq_len, d_model)
+            deterministic: If False, apply jitter noise.
+
+        Returns:
+            gates:       (batch, seq_len, top_k) — normalised weights for
+                         the selected global experts.
+            indices:     (batch, seq_len, top_k) — global expert indices.
+            aux_loss:    Scalar — group-level + expert-level load-balance loss.
+            z_loss:      Scalar — z-loss on both group and expert logits.
+        """
+        G = self.n_expert_groups
+        E = self.n_experts
+        K = self.top_k
+        M = E // G  # experts per group
+
+        B, T, _ = x.shape
+
+        # ---- Stage 1: group router (B, T, G) ----
+        group_logits = nn.Dense(
+            G, use_bias=False,
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="group_router",
+        )(x)
+
+        # ---- Stage 2: expert router (B, T, E) ----
+        expert_logits = nn.Dense(
+            E, use_bias=False,
+            kernel_init=nn.initializers.xavier_uniform(),
+            name="expert_router",
+        )(x)
+
+        # Optional jitter noise during training
+        if not deterministic and self.jitter_noise > 0.0:
+            rng = self.make_rng("dropout")
+            rng_g, rng_e = jax.random.split(rng)
+            group_logits = group_logits + jax.random.uniform(
+                rng_g, group_logits.shape,
+                minval=-self.jitter_noise, maxval=self.jitter_noise,
+            )
+            expert_logits = expert_logits + jax.random.uniform(
+                rng_e, expert_logits.shape,
+                minval=-self.jitter_noise, maxval=self.jitter_noise,
+            )
+
+        # ---- Z-loss on both routers ----
+        z_loss = (
+            jnp.mean(jax.nn.logsumexp(group_logits, axis=-1) ** 2) +
+            jnp.mean(jax.nn.logsumexp(expert_logits, axis=-1) ** 2)
+        )
+
+        # ---- Stage 1: select top-1 group per token ----
+        group_probs = jax.nn.softmax(group_logits, axis=-1)        # (B, T, G)
+        _, group_idx_raw = jax.lax.top_k(group_logits, 1)          # (B, T, 1)
+        group_idx = group_idx_raw[..., 0]                           # (B, T)
+
+        # ---- Stage 2: mask expert logits to the selected group ----
+        # Reshape expert logits → (B, T, G, M)
+        expert_logits_grouped = expert_logits.reshape(B, T, G, M)
+
+        # For each token, extract logits of its chosen group
+        group_oh = jax.nn.one_hot(group_idx, G)            # (B, T, G)
+        # Einsum selects the group_idx-th slice along the G axis per token
+        selected_logits = jnp.einsum(
+            "btg,btgm->btm", group_oh, expert_logits_grouped
+        )  # (B, T, M)
+
+        # Pick top-k within selected group
+        top_k_vals, intra_idx = jax.lax.top_k(selected_logits, K)  # (B, T, K)
+        gates = jax.nn.softmax(top_k_vals, axis=-1)                  # (B, T, K)
+
+        # Convert intra-group indices → global expert indices
+        # global = intra + group_idx * M
+        global_indices = intra_idx + group_idx[..., None] * M        # (B, T, K)
+
+        # ---- Group-level load-balancing auxiliary loss ----
+        N = B * T
+        flat_group_idx = group_idx.reshape(N)                        # (N,)
+        group_dispatch = jax.nn.one_hot(flat_group_idx, G)           # (N, G)
+        f_g = jnp.mean(group_dispatch, axis=0)                       # (G,)
+        P_g = jnp.mean(group_probs.reshape(N, G), axis=0)            # (G,)
+        group_aux = G * jnp.sum(f_g * P_g)
+
+        # ---- Expert-level load-balancing auxiliary loss ----
+        expert_probs = jax.nn.softmax(expert_logits, axis=-1)         # (B, T, E)
+        flat_global_top1 = global_indices.reshape(N, K)[:, 0]        # (N,)
+        expert_dispatch = jax.nn.one_hot(flat_global_top1, E)        # (N, E)
+        f_e = jnp.mean(expert_dispatch, axis=0)                      # (E,)
+        P_e = jnp.mean(expert_probs.reshape(N, E), axis=0)           # (E,)
+        expert_aux = E * jnp.sum(f_e * P_e)
+
+        aux_loss = group_aux + expert_aux
+
+        return gates, global_indices, aux_loss, z_loss
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical MoE Layer
+# ---------------------------------------------------------------------------
+
+class HierMoELayer(nn.Module):
+    """Capacity-aware Hierarchical MoE layer.
+
+    Uses :class:`HierRouter` for two-stage (group → expert) routing, then
+    the same static-shape token dispatch / collect pattern as
+    :class:`MoELayer` for JIT-friendly sparse execution.
+
+    Requires ``config.n_expert_groups > 1`` and
+    ``config.n_experts % config.n_expert_groups == 0``.
+    """
+
+    config: NanoMoEConfig
+
+    @nn.compact
+    def __call__(
+        self, x: jnp.ndarray, deterministic: bool = True
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """Forward pass.
+
+        Args:
+            x: (batch, seq_len, d_model)
+            deterministic: If True, disable dropout and jitter noise.
+
+        Returns:
+            output:       (batch, seq_len, d_model)
+            combined_aux: Scalar — aux load-balance loss + z_loss_coeff * z_loss.
+        """
+        cfg = self.config
+        B, T, D = x.shape
+        N = B * T
+        E, K, G = cfg.n_experts, cfg.top_k, cfg.n_expert_groups
+
+        # ---- Hierarchical Router ----
+        gates, indices, aux_loss, z_loss = HierRouter(
+            n_expert_groups=G, n_experts=E, top_k=K,
+            jitter_noise=cfg.router_jitter_noise,
+        )(x, deterministic=deterministic)
+        gates_flat = gates.reshape(N, K)      # (N, K)
+        indices_flat = indices.reshape(N, K)  # (N, K)
+
+        # ---- Capacity per expert ----
+        capacity = max(1, math.ceil(cfg.capacity_factor * N / E))
+
+        # ---- Build dispatch tensor (same as MoELayer) ----
+        expert_mask = jax.nn.one_hot(indices_flat, E)           # (N, K, E)
+        flat_mask   = expert_mask.reshape(N * K, E)             # (N*K, E)
+        cumcounts   = jnp.cumsum(flat_mask, axis=0)             # (N*K, E)
+        slot_indices = jnp.sum(
+            (cumcounts.reshape(N, K, E) - 1) * expert_mask, axis=-1
+        ).astype(jnp.int32)  # (N, K)
+
+        capacity_mask  = slot_indices < capacity                 # (N, K)
+        effective_gates = jnp.where(capacity_mask, gates_flat, 0.0)
+
+        safe_slots = jnp.clip(slot_indices, 0, capacity - 1)    # (N, K)
+        slot_oh    = jax.nn.one_hot(safe_slots, capacity)        # (N, K, C)
+        dispatch   = jnp.einsum(
+            "nke,nkc->ecn",
+            expert_mask * capacity_mask[..., None],
+            slot_oh,
+        )  # (E, C, N)
+
+        # ---- Gather → run experts → collect ----
+        tokens       = x.reshape(N, D)                           # (N, D)
+        expert_input = jnp.einsum("ecn,nd->ecd", dispatch, tokens)  # (E, C, D)
+
+        experts = [
+            ExpertFFN(d_ff=cfg.d_ff, d_model=D, name=f"expert_{i}")
+            for i in range(E)
+        ]
+        expert_outputs = jnp.stack(
+            [experts[i](expert_input[i]) for i in range(E)], axis=0
+        )  # (E, C, D)
+
+        per_expert_output = jnp.einsum(
+            "ecn,ecd->end", dispatch, expert_outputs
+        )  # (E, N, D)
+
+        per_expert_gate = jnp.einsum(
+            "nk,nke->ne", effective_gates, expert_mask
+        )  # (N, E)
+        output_flat = jnp.einsum(
+            "ne,end->nd", per_expert_gate, per_expert_output
+        )  # (N, D)
+
+        output = output_flat.reshape(B, T, D)
+        output = nn.Dropout(rate=cfg.dropout_rate)(output, deterministic=deterministic)
+
+        combined_aux = aux_loss + cfg.z_loss_coeff * z_loss
+        return output, combined_aux
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical Transformer Block
+# ---------------------------------------------------------------------------
+
+class HierTransformerBlock(nn.Module):
+    """Pre-norm transformer block using :class:`HierMoELayer` instead of
+    the flat :class:`MoELayer`."""
+
+    config: NanoMoEConfig
+
+    @nn.compact
+    def __call__(
+        self, x: jnp.ndarray, deterministic: bool = True
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        # Self-attention sub-layer
+        residual = x
+        x = nn.LayerNorm()(x)
+        x = MultiHeadAttention(config=self.config)(x, deterministic=deterministic)
+        x = x + residual
+
+        # HierMoE sub-layer
+        residual = x
+        x_norm = nn.LayerNorm()(x)
+        moe_out, aux_loss = HierMoELayer(config=self.config)(
+            x_norm, deterministic=deterministic
+        )
+        x = moe_out + residual
+
+        return x, aux_loss

@@ -25,6 +25,11 @@ class NanoMoEConfig:
         router_jitter_noise: Half-width of uniform additive noise applied to
             router logits during training (0 = disabled).  Improves exploration
             and reduces expert collapse.
+        n_expert_groups: Number of expert groups for HierMoE two-stage routing.
+            Must evenly divide ``n_experts``.  Set to 1 (default) to use flat
+            routing (``HierMoELayer`` degenerates to standard top-k MoE).
+            Values > 1 enable the coarse group router followed by the fine
+            within-group router.
         dropout_rate: Dropout probability (used during training).
         aux_loss_coeff: Weight of the load-balancing auxiliary loss.
         z_loss_coeff: Weight of the z-loss that penalises large router logit
@@ -50,6 +55,9 @@ class NanoMoEConfig:
     # --- MoE routing ---
     capacity_factor: float = 1.25
     router_jitter_noise: float = 0.0
+    # HierMoE: number of expert groups for two-stage routing.
+    # Must evenly divide n_experts.  Set to 1 (default) for flat routing.
+    n_expert_groups: int = 1
 
     # --- Regularization ---
     dropout_rate: float = 0.1

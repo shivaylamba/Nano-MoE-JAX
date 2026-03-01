@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 
 from nano_moe.config import NanoMoEConfig
-from nano_moe.layers import TransformerBlock
+from nano_moe.layers import TransformerBlock, HierTransformerBlock
 
 
 class NanoMoE(nn.Module):
@@ -117,6 +117,87 @@ class NanoMoE(nn.Module):
             rng, sample_rng = jax.random.split(rng)
             next_token = jax.random.categorical(sample_rng, next_logits, axis=-1)  # (1,)
             next_token = next_token[:, None]  # (1, 1)
+            tokens = jnp.concatenate([tokens, next_token], axis=1)
+
+        return tokens
+
+
+class HierNanoMoE(nn.Module):
+    """Hierarchical Mixture-of-Experts language model.
+
+    Identical to :class:`NanoMoE` except each transformer block uses
+    :class:`~nano_moe.layers.HierTransformerBlock` with two-stage
+    (group → expert) routing provided by
+    :class:`~nano_moe.layers.HierRouter`.
+
+    Requires ``config.n_expert_groups > 1`` and
+    ``config.n_experts % config.n_expert_groups == 0``.
+    """
+
+    config: NanoMoEConfig
+
+    @nn.compact
+    def __call__(
+        self, x: jnp.ndarray, deterministic: bool = True
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        cfg = self.config
+        B, T = x.shape
+
+        tok_emb = nn.Embed(
+            num_embeddings=cfg.vocab_size,
+            features=cfg.d_model,
+            embedding_init=nn.initializers.normal(stddev=0.02),
+        )(x)
+
+        pos_emb = self.param(
+            "pos_emb",
+            nn.initializers.normal(stddev=0.02),
+            (1, cfg.block_size, cfg.d_model),
+        )
+        x = tok_emb + pos_emb[:, :T, :]
+        x = nn.Dropout(rate=cfg.dropout_rate)(x, deterministic=deterministic)
+
+        total_aux_loss = jnp.float32(0.0)
+        for i in range(cfg.n_layers):
+            x, aux_loss = HierTransformerBlock(config=cfg, name=f"block_{i}")(
+                x, deterministic=deterministic
+            )
+            total_aux_loss = total_aux_loss + aux_loss
+
+        x = nn.LayerNorm()(x)
+        logits = nn.Dense(
+            cfg.vocab_size,
+            kernel_init=nn.initializers.normal(stddev=0.02),
+        )(x)
+
+        return logits, total_aux_loss
+
+    def generate(
+        self,
+        params,
+        rng: jax.Array,
+        prompt: jnp.ndarray,
+        max_new_tokens: int = 100,
+        temperature: float = 0.8,
+        top_k_sample: int = 40,
+    ) -> jnp.ndarray:
+        """Autoregressive token generation (identical API to :class:`NanoMoE`)."""
+        cfg = self.config
+        tokens = prompt
+
+        for _ in range(max_new_tokens):
+            x_cond = tokens[:, -cfg.block_size:]
+            logits, _ = self.apply({"params": params}, x_cond, deterministic=True)
+            next_logits = logits[:, -1, :] / temperature
+
+            if top_k_sample > 0:
+                top_vals, _ = jax.lax.top_k(next_logits, top_k_sample)
+                threshold = top_vals[:, -1:]
+                next_logits = jnp.where(next_logits < threshold, -1e9, next_logits)
+
+            rng, sample_rng = jax.random.split(rng)
+            next_token = jax.random.categorical(sample_rng, next_logits, axis=-1)
+            next_token = next_token[:, None]
             tokens = jnp.concatenate([tokens, next_token], axis=1)
 
         return tokens
